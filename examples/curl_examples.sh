@@ -7,7 +7,8 @@
 # 未满足/多级依赖/人工送达锚点、出口清点（幂等登记/拒绝/更正/查询）、
 # 逐段实际通行核报（顺序核报/幂等/异常/滞留改编前缀保留/重置）、
 # 烟雾暴露时段与累计暴露上限（等待消散/重叠与超限拒绝/已出发保护/重置）、
-# 修订追溯。
+# 中途节点计划滞留限流（推迟上游/改道/起点等待免费/重叠与已出发超额拒绝/
+# 逐分钟停留查询/滞留报告待救援/重置）、修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -720,5 +721,98 @@ curl -s -X POST "$BASE/scenario" \
   }' > /dev/null
 curl -s "$BASE/smoke-windows" | python3 -m json.tool
 curl -s "$BASE/smoke-limits" | python3 -m json.tool
+
+# ---- 中途节点计划滞留限流 ----
+
+say "78) 重置节点限流演示场景：两组各10人 1->2(4)，通道5(2->6,1分钟) 封闭[4,6)"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 100},
+      {"id": 2, "src": 2, "dst": 3, "minutes": 9, "capacity": 100},
+      {"id": 3, "src": 3, "dst": 5, "minutes": 9, "capacity": 100},
+      {"id": 5, "src": 2, "dst": 6, "minutes": 1, "capacity": 100}
+    ],
+    "exits": [5, 6],
+    "closures": [{"edge_id": 5, "start_minute": 4, "end_minute": 6}],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 40},
+      {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 5, "deadline": 40}
+    ]
+  }' > /dev/null
+
+say "79) 登记节点2第4..6分钟每分钟最多15人：组1在节点2等待[4,6)，组2错峰（推迟通道1到第2分钟进入）"
+curl -s -X POST "$BASE/node-controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 4, "end_minute": 6, "capacity": 15}' \
+  | python3 -m json.tool
+
+say "80) 查询节点2逐分钟计划停留人数（两组错峰，第4/5分钟各10人）"
+curl -s "$BASE/nodes/2/stays" | python3 -m json.tool
+
+say "81) 无效登记：节点不存在(422)、出口节点6(422)、上限0(422)、时段无效(422)"
+for body in \
+  '{"node_id": 99, "start_minute": 0, "end_minute": 5, "capacity": 3}' \
+  '{"node_id": 6, "start_minute": 0, "end_minute": 5, "capacity": 3}' \
+  '{"node_id": 2, "start_minute": 0, "end_minute": 5, "capacity": 0}' \
+  '{"node_id": 2, "start_minute": 5, "end_minute": 5, "capacity": 3}'; do
+  curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/node-controls" \
+    -H 'Content-Type: application/json' -d "$body"
+done
+
+say "82) 同节点时段重叠 -> 409 NODE_CONTROL_OVERLAP（整次拒绝）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/node-controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 5, "end_minute": 9, "capacity": 15}'
+python3 -m json.tool /tmp/resp.json || true
+# 端点相接（起点=已有终点6）允许
+curl -s -o /dev/null -w '端点相接 HTTP %{http_code}\n' -X POST "$BASE/node-controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 6, "end_minute": 9, "capacity": 15}'
+
+say "83) 推进到第4分钟两组均已固定后，登记使固定等待超额的限流(每分钟5人) -> 409"
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' -d '{"minutes": 4}' > /dev/null
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/node-controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 4, "end_minute": 6, "capacity": 5}'
+python3 -m json.tool /tmp/resp.json || true
+# 名额能容纳（每分钟20人）时受理，已出发组路线不变
+curl -s -o /dev/null -w '容量20可受理 HTTP %{http_code}\n' -X POST "$BASE/node-controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 4, "end_minute": 6, "capacity": 20}'
+
+say "84) 唯一路线场景：节点限流9人、报告滞留至第8分钟（固定等待10人超额）-> 待救援"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 2, "capacity": 30},
+      {"id": 5, "src": 2, "dst": 6, "minutes": 1, "capacity": 30}
+    ],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 40}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' -d '{"minutes": 2}' > /dev/null
+curl -s -X POST "$BASE/node-controls" -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "start_minute": 2, "end_minute": 8, "capacity": 9}' > /dev/null
+curl -s -X POST "$BASE/groups/1/delay-report" -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 8}' | python3 -m json.tool
+
+say "85) 场景重置清空全部节点限流（旧修订保留）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20}],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s "$BASE/node-controls" | python3 -m json.tool
 
 say "完成。交互文档： $BASE/docs"

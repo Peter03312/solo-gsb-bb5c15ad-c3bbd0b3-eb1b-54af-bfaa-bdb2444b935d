@@ -13,6 +13,12 @@
   数据原样保留、不触发任何重排；
 * 登记容量管制若与同通道已有管制重叠，或新上限使已出发组剩余路线在
   任一分钟超载，同样整次拒绝（409），不改动任何状态；
+* 现场可按非出口节点登记计划滞留限流时段（左闭右开、每分钟最多停留
+  人数，同节点不重叠）：只计一组从前一通道离开到进入下一通道之间的
+  中途等待，出发前起点等待、通道在途与抵达出口后不计，未登记分钟不限
+  额。编排把烟雾、封闭、通道限流与节点限流造成的等待一并计入，必要时
+  推迟上游通行或改走路线；登记时段若使已出发组固定余程的计划滞留超额，
+  整次拒绝（409），成功后仅重排未出发组，成功登记产生一条修订。
 * 纠正人群组时任一项无效（未知组/最终字段不合法/起点非场馆节点），
   或目标组在受理前已因时间推进而出发，整批拒绝（422/409），
   状态与修订历史不变；
@@ -92,6 +98,7 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       ExitCountIn, ExitCountListOut, ExitCountRecordOut,
                       GroupChangeOut, GroupCorrectionIn, GroupIn,
                       GroupPlanOut, GroupTallyOut,
+                      NodeControlIn, NodeControlListOut, NodeControlOut,
                       PlanResponse, PrerequisiteBasisOut, PrerequisiteIn,
                       PrerequisiteListOut, PrerequisiteOut,
                       RescueCompletionIn, RescueDispatchIn,
@@ -135,9 +142,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.7.0",
+    version="1.8.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
+                "非出口中途节点的计划滞留限流时段（按每分钟最多停留人数"
+                "核算，可推迟上游通行或改道）、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
                 "按通道登记烟雾暴露时段与按组登记非负累计暴露上限"
                 "（可等待烟雾消散后通行、超限路线不可安排）、"
@@ -383,6 +392,11 @@ async def _replan_pending(conn: aiosqlite.Connection,
                 for (eid, minute), add in result["load_delta"].items():
                     key = (eid, minute)
                     world.fixed_load[key] = world.fixed_load.get(key, 0) + add
+                # 中途节点的计划滞留逐分钟占名额（出发前起点等待不在其中）
+                for (nid, minute), add in result["node_wait_delta"].items():
+                    key = (nid, minute)
+                    world.fixed_node_load[key] = (
+                        world.fixed_node_load.get(key, 0) + add)
             else:
                 states[g["id"]] = {"status": "failed",
                                    "arrival_minute": None,
@@ -464,6 +478,63 @@ async def _capacity_control_conflicts(conn: aiosqlite.Connection,
     ]
 
 
+async def _node_control_conflicts(conn: aiosqlite.Connection,
+                                  node_id: int, a: int, b: int,
+                                  cap: int) -> list[dict]:
+    """检查新节点限流是否使已出发组固定余程的计划滞留任一分钟超额。
+
+    节点名额只覆盖"前一通道离开到进入下一通道之间"的中途等待；末段之后
+    抵达出口、出发前起点等待均不计。固定组路线不可重排，故逐分钟核对其
+    未来（>= 当前分钟）的中途等待；待救援/救援中/已救援组没有未来余程，
+    不在检查之列；未出发组会随登记重排。
+    """
+    minute_now = await db.get_current_minute(conn)
+    async with conn.execute(
+            """
+            SELECT g.id, g.size, rs.to_node, rs.exit_minute,
+                   nxt.enter_minute
+            FROM route_steps rs
+            JOIN groups g ON g.id = rs.group_id
+            JOIN route_steps nxt
+              ON nxt.group_id = g.id AND nxt.seq = rs.seq + 1
+            WHERE g.status='fixed' AND rs.to_node=?
+            ORDER BY g.id, rs.seq
+            """, (node_id,)) as cur:
+        rows = await cur.fetchall()
+    per_minute: dict[int, dict] = {}
+    for gid, size, _nid, exit_m, next_enter in rows:
+        lo = max(exit_m, minute_now, a)
+        hi = min(next_enter, b)
+        for m in range(lo, hi):
+            slot = per_minute.setdefault(m, {"used": 0, "groups": []})
+            slot["used"] += size
+            slot["groups"].append({"group_id": gid, "size": size})
+    return [
+        {"node_id": node_id, "minute": m, "used": slot["used"],
+         "capacity": cap, "groups": slot["groups"]}
+        for m, slot in sorted(per_minute.items())
+        if slot["used"] > cap
+    ]
+
+
+async def _node_exists(conn: aiosqlite.Connection, node_id: int) -> bool:
+    """节点是否属于当前场馆（任一通道端点或出口）。"""
+    async with conn.execute(
+            "SELECT 1 FROM edges WHERE src=? OR dst=? LIMIT 1",
+            (node_id, node_id)) as cur:
+        if await cur.fetchone() is not None:
+            return True
+    async with conn.execute("SELECT 1 FROM exits WHERE node_id=? LIMIT 1",
+                            (node_id,)) as cur:
+        return await cur.fetchone() is not None
+
+
+async def _is_exit(conn: aiosqlite.Connection, node_id: int) -> bool:
+    async with conn.execute("SELECT 1 FROM exits WHERE node_id=? LIMIT 1",
+                            (node_id,)) as cur:
+        return await cur.fetchone() is not None
+
+
 # --------------------------------------------------------------------------
 # 现场节点滞留报告
 # --------------------------------------------------------------------------
@@ -480,6 +551,10 @@ _RESCUE_DETAIL = {
         "组自节点 {node} 第 {recovery} 分钟恢复：忽略容量限制后可在截止前"
         "到达，现有封闭/限流与其他已出发组的固定占用阻断了截止前全部余程，"
         "标记待救援",
+    "INSUFFICIENT_NODE_CAPACITY":
+        "组自节点 {node} 第 {recovery} 分钟恢复：忽略中途节点计划滞留名额"
+        "后可在截止前到达，节点限流与既有封闭、通道容量共同阻断了截止前"
+        "全部余程，标记待救援",
     "UNREACHABLE_EXIT":
         "滞留节点 {node} 与任何出口之间不存在连通路径，标记待救援",
     "EXPOSURE_LIMIT_EXCEEDED":
@@ -683,6 +758,15 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
         # 2) 以滞留节点为起点、恢复分钟为最早出发重找余程。此时 world 的
         #    固定占用含其他已出发组（本组旧余程已删除，不会重复计数）
         world, _pending, _pre, _states, _limits = await db.load_world(conn)
+        # 该组在滞留节点上"自当前分钟到恢复分钟"的等待属于前一通道离开后、
+        # 下一通道进入前的中途滞留，按人数占用该节点每分钟名额（恢复分钟
+        # 恰为当前分钟时区间为空）。这是本组恢复前已必须占用的槽位，作为
+        # 本组预占传入（不能与 world.fixed_node_load 混同，否则本组余程
+        # 等待会复用自己的名额）。
+        own_wait: dict[tuple[int, int], int] = {}
+        for minute in range(minute_now, recovery_minute):
+            own_wait[(node_id, minute)] = (
+                own_wait.get((node_id, minute), 0) + size)
         if recovery_minute > deadline:
             result = {
                 "group_id": group_id,
@@ -695,7 +779,9 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
                 group_id=group_id, size=size, origin=node_id,
                 earliest_departure=recovery_minute, deadline=deadline,
                 current_minute=minute_now, world=world,
-                smoke_limit=smoke_limit, exposure_used=exposure_used)
+                smoke_limit=smoke_limit, exposure_used=exposure_used,
+                start_is_intermediate=True,
+                fixed_node_wait=own_wait or None)
 
         if result["status"] == "scheduled":
             arrival = result["arrival_minute"]
@@ -1267,6 +1353,184 @@ async def list_capacity_controls(request: Request):
         controls=[CapacityControlOut(
             edge_id=row[0], start_minute=row[1], end_minute=row[2],
             capacity=row[3]) for row in rows])
+
+
+# --------------------------------------------------------------------------
+# 中途节点计划滞留限流
+# --------------------------------------------------------------------------
+
+@app.post("/node-controls", tags=["节点滞留限流"], response_model=PlanResponse,
+          status_code=201,
+          responses={
+              409: {"description": "同节点限流时段重叠，或新时段使已出发组"
+                                   "固定余程的计划滞留任一分钟超额，整次拒绝"},
+              422: {"description": "节点不存在、节点为出口、时段无效、上限"
+                                   "非正或起点早于当前分钟"}})
+async def add_node_control(control: NodeControlIn, request: Request):
+    """登记一个非出口节点的计划滞留限流时段（左闭右开）。
+
+    时段 ``[start_minute, end_minute)`` 内该节点每分钟最多停留
+    ``capacity`` 人；同一节点的限流时段互不重叠（端点相接允许），未登记
+    的分钟不限额。名额只覆盖一组**从前一通道离开到进入下一通道之间**的
+    中途等待：出发前起点等待、通道在途与抵达出口后均不计。编排把烟雾、
+    封闭、通道限流与节点限流造成的等待一并计入，必要时推迟上游通行或改
+    走路线，在现有截止、优先级与路线择优规则下选最优可行方案。
+
+    * 节点不存在（非场馆节点）返回 422；节点为出口返回 422
+      （抵达出口后不计滞留名额）；
+    * 时段无效（``end_minute <= start_minute``）、上限非正（pydantic 422）
+      或起点早于当前分钟返回 422；
+    * 与同节点已有限流时段重叠返回 409 ``NODE_CONTROL_OVERLAP``；
+    * 新上限使**已出发组固定余程**的计划滞留任一分钟超额，返回 409
+      ``NODE_CONTROL_OVERLOADS_DEPARTED_GROUP``（逐分钟给出节点、分钟、
+      计划停留人数、上限与相关组）。
+
+    以上拒绝均整次不留状态、不改编排、不产生修订。成功后仅重排未出发组
+    （已出发组路线与占用保留），登记时段并产生一条 ``node-controls`` 修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        if not await _node_exists(conn, control.node_id):
+            raise HTTPException(
+                422, f"节点 {control.node_id} 不存在（非场馆节点）")
+        if await _is_exit(conn, control.node_id):
+            raise HTTPException(
+                422, f"节点 {control.node_id} 是出口，抵达出口后不计计划"
+                     f"滞留名额，不可登记节点限流")
+        if control.start_minute < minute_now:
+            raise HTTPException(
+                422, f"节点限流起点 {control.start_minute} 早于当前分钟 "
+                     f"{minute_now}")
+
+        async with conn.execute(
+                """SELECT start_minute, end_minute FROM node_controls
+                   WHERE node_id=? ORDER BY start_minute""",
+                (control.node_id,)) as cur:
+            existing = await cur.fetchall()
+        overlaps = [(a, b) for a, b in existing
+                    if control.start_minute < b and a < control.end_minute]
+        if overlaps:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "NODE_CONTROL_OVERLAP",
+                    "message": "同一节点的限流时段不得重叠，整次拒绝",
+                    "conflicts": [
+                        {"node_id": control.node_id,
+                         "existing": [a, b],
+                         "requested": [control.start_minute,
+                                       control.end_minute]}
+                        for a, b in overlaps],
+                })
+
+        conflicts = await _node_control_conflicts(
+            conn, control.node_id, control.start_minute,
+            control.end_minute, control.capacity)
+        if conflicts:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "NODE_CONTROL_OVERLOADS_DEPARTED_GROUP",
+                    "message": "新节点限流使已出发组固定余程的计划滞留"
+                               "在部分分钟超额，整次拒绝",
+                    "conflicts": conflicts,
+                })
+
+        before = await _build_plan_response(conn)
+        async with db.transaction(conn):
+            await db.insert_node_control(
+                conn, node_id=control.node_id,
+                start_minute=control.start_minute,
+                end_minute=control.end_minute,
+                capacity=control.capacity)
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await db.insert_revision(conn, "node-controls",
+                                     control.model_dump(),
+                                     _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/node-controls", tags=["节点滞留限流"],
+         response_model=NodeControlListOut)
+async def list_node_controls(request: Request):
+    """列出当前全部中途节点计划滞留限流时段（按节点、开始分钟排序）。
+
+    场景重置会清除全部节点限流记录；历史时段可通过修订快照追溯。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        controls = await db.load_node_controls(conn)
+    return NodeControlListOut(
+        current_minute=minute_now,
+        controls=[NodeControlOut(**c) for c in controls])
+
+
+@app.get("/nodes/{node_id}/stays", tags=["节点滞留限流"])
+async def get_node_stays(node_id: int, request: Request,
+                         minute: int | None = None):
+    """查询节点限流时段与逐分钟**计划停留人数**，可加 ``?minute=n``。
+
+    逐分钟人数只统计各组"前一通道离开到进入下一通道之间"在该节点的中途
+    等待（出发前起点等待、通道在途与抵达出口后不计），并给出每组当时
+    状态（scheduled/fixed）。限流覆盖的分钟即使无人等待也会列出
+    （``used=0``）；未登记限流的分钟若有计划等待同样列出，``capacity``
+    为 null 表示该分钟不限额。节点不属于当前场馆返回 404。
+    """
+    conn = request.app.state.db
+    if not await _node_exists(conn, node_id):
+        raise HTTPException(404, f"节点 {node_id} 不存在（非场馆节点）")
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                """SELECT g.id, g.size, g.status, rs.exit_minute,
+                          nxt.enter_minute
+                   FROM route_steps rs
+                   JOIN groups g ON g.id = rs.group_id
+                   JOIN route_steps nxt
+                     ON nxt.group_id = g.id AND nxt.seq = rs.seq + 1
+                   WHERE rs.to_node=?
+                   ORDER BY g.id, rs.seq""",
+                (node_id,)) as cur:
+            rows = await cur.fetchall()
+        per_minute: dict[int, dict] = {}
+        for gid, size, status, exit_m, next_enter in rows:
+            for m in range(exit_m, next_enter):
+                slot = per_minute.setdefault(
+                    m, {"minute": m, "used": 0, "groups": []})
+                slot["used"] += size
+                slot["groups"].append(
+                    {"group_id": gid, "size": size, "status": status})
+        controls = [
+            (c["start_minute"], c["end_minute"], c["capacity"])
+            for c in await db.load_node_controls(conn)
+            if c["node_id"] == node_id]
+        # 限流覆盖的分钟即使无计划等待也列出，便于核对名额
+        for a, b, _cap in controls:
+            for m in range(a, b):
+                per_minute.setdefault(
+                    m, {"minute": m, "used": 0, "groups": []})
+
+        def limit_at(m: int):
+            for a, b, cap in controls:
+                if a <= m < b:
+                    return cap
+            return None
+
+        slots = []
+        for m in sorted(per_minute):
+            if minute is not None and m != minute:
+                continue
+            slot = per_minute[m]
+            slot["capacity"] = limit_at(m)
+            slots.append(slot)
+        return {"node_id": node_id, "current_minute": minute_now,
+                "node_controls": [
+                    {"node_id": node_id, "start_minute": a, "end_minute": b,
+                     "capacity": cap} for a, b, cap in controls],
+                "minutes": slots}
 
 
 # --------------------------------------------------------------------------

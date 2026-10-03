@@ -60,6 +60,37 @@ class CapacityControlListOut(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# 中途节点计划滞留限流
+# --------------------------------------------------------------------------
+
+class NodeControlIn(BaseModel):
+    node_id: int = Field(..., ge=0, description="被限流的非出口节点编号")
+    start_minute: int = Field(..., ge=0, description="限流开始分钟（含，须不早于当前分钟）")
+    end_minute: int = Field(..., ge=0, description="限流结束分钟（不含）")
+    capacity: int = Field(..., gt=0,
+                          description="时段内该节点每分钟最多停留人数（正整数）")
+
+    @model_validator(mode="after")
+    def _half_open(self):
+        if self.end_minute <= self.start_minute:
+            raise ValueError(
+                "节点限流时段需为左闭右开：end_minute 必须大于 start_minute")
+        return self
+
+
+class NodeControlOut(BaseModel):
+    node_id: int
+    start_minute: int
+    end_minute: int
+    capacity: int
+
+
+class NodeControlListOut(BaseModel):
+    current_minute: int
+    controls: list[NodeControlOut]
+
+
+# --------------------------------------------------------------------------
 # 烟雾暴露时段与累计暴露上限
 # --------------------------------------------------------------------------
 

@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS smoke_windows (
     smoke_value  INTEGER NOT NULL
 );
 
+-- 中途节点计划滞留限流：左闭右开 [start_minute, end_minute)，时段内该
+-- 非出口节点每分钟最多停留 capacity 人；同一节点的限流时段互不重叠，
+-- 未登记的分钟不限额。只计"前一通道离开到进入下一通道之间"的中途等待，
+-- 出发前起点等待、通道在途与抵达出口后不计。
+CREATE TABLE IF NOT EXISTS node_controls (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id      INTEGER NOT NULL,
+    start_minute INTEGER NOT NULL,
+    end_minute   INTEGER NOT NULL,
+    capacity     INTEGER NOT NULL
+);
+
 -- 人群组非负累计暴露上限：仅登记过上限的组受烟雾暴露约束（其余无此行、
 -- 不受约束）。同一组再次登记替换旧值（UPSERT 覆盖）。
 CREATE TABLE IF NOT EXISTS group_smoke_limits (
@@ -196,6 +208,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
+                                      -- node-controls |
                                       -- group-prerequisites |
                                       -- delay-reports | rescue-dispatches |
                                       -- rescue-completions | tick
@@ -221,14 +234,15 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订号继续全局递增。
     """
     # 人工救援队与其救援任务随场景重置清空；先导关系与出口清点记录（含更正
-    # 历史）亦清空；逐段实际通行核报记录同样清空；本场烟雾暴露时段与各组
-    # 暴露上限一并清空；修订历史不在清空之列
+    # 历史）亦清空；逐段实际通行核报记录同样清空；本场烟雾暴露时段、各组
+    # 暴露上限与中途节点滞留限流记录一并清空；修订历史不在清空之列
     for table in ("rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
                   "exit_count_corrections", "exit_counts",
                   "traversal_reports",
                   "route_steps", "groups", "closures",
                   "capacity_controls", "smoke_windows",
+                  "node_controls",
                   "group_smoke_limits", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
@@ -304,6 +318,14 @@ async def load_world(db: aiosqlite.Connection):
         for edge_id, a, b, value in await cur.fetchall():
             smoke_windows.setdefault(edge_id, []).append((a, b, value))
 
+    node_controls: dict[int, list[tuple[int, int, int]]] = {}
+    async with db.execute(
+            """SELECT node_id, start_minute, end_minute, capacity
+               FROM node_controls
+               ORDER BY node_id, start_minute""") as cur:
+        for node_id, a, b, cap in await cur.fetchall():
+            node_controls.setdefault(node_id, []).append((a, b, cap))
+
     # 已固定（已出发）组的占用：仅计当前分钟起尚未走完的部分
     minute_now = await get_current_minute(db)
     fixed_load: dict[tuple[int, int], int] = {}
@@ -318,10 +340,37 @@ async def load_world(db: aiosqlite.Connection):
                 key = (edge_id, minute)
                 fixed_load[key] = fixed_load.get(key, 0) + size
 
+    # 已固定组在中途节点上的计划滞留：仅计"前一段离开到进入下一段之间"
+    # 且不早于当前分钟的逐分钟人数。出发前起点等待与抵达出口后均不计；
+    # 相邻段首尾相接（exit==next enter）时区间为空，自然不产生名额占用。
+    fixed_node_load: dict[tuple[int, int], int] = {}
+    async with db.execute(
+            """
+            SELECT g.id, g.size, rs.seq, rs.to_node, rs.exit_minute,
+                   nxt.enter_minute
+            FROM route_steps rs
+            JOIN groups g ON g.id = rs.group_id
+            LEFT JOIN route_steps nxt
+                   ON nxt.group_id = rs.group_id AND nxt.seq = rs.seq + 1
+            WHERE g.status='fixed'
+            ORDER BY g.id, rs.seq
+            """) as cur:
+        wait_rows = await cur.fetchall()
+    for _gid, size, _seq, _to_node, exit_m, next_enter in wait_rows:
+        if next_enter is None:
+            continue  # 末段之后即抵达出口，抵达出口后不计
+        for minute in range(max(exit_m, minute_now), next_enter):
+            if minute < minute_now:
+                continue
+            key = (_to_node, minute)
+            fixed_node_load[key] = fixed_node_load.get(key, 0) + size
+
     world = World(edges=edges, adjacency=adjacency, exits=exits,
                   closures=closures, fixed_load=fixed_load,
                   capacity_controls=capacity_controls,
-                  smoke_windows=smoke_windows)
+                  smoke_windows=smoke_windows,
+                  node_controls=node_controls,
+                  fixed_node_load=fixed_node_load)
 
     async with db.execute(
             """SELECT id, size, origin, earliest_departure, priority,
@@ -399,6 +448,32 @@ async def upsert_smoke_limit(db: aiosqlite.Connection, *, group_id: int,
            ON CONFLICT(group_id) DO UPDATE SET
                smoke_limit=excluded.smoke_limit""",
         (group_id, smoke_limit))
+
+
+# --------------------------------------------------------------------------
+# 中途节点计划滞留限流
+# --------------------------------------------------------------------------
+
+async def insert_node_control(db: aiosqlite.Connection, *, node_id: int,
+                              start_minute: int, end_minute: int,
+                              capacity: int) -> None:
+    """登记一条中途节点滞留限流时段（调用方负责事务与全部校验）。"""
+    await db.execute(
+        """INSERT INTO node_controls
+           (node_id, start_minute, end_minute, capacity)
+           VALUES(?,?,?,?)""",
+        (node_id, start_minute, end_minute, capacity))
+
+
+async def load_node_controls(db: aiosqlite.Connection) -> list[dict]:
+    """按节点、开始分钟升序列出全部中途节点滞留限流时段。"""
+    async with db.execute(
+            """SELECT node_id, start_minute, end_minute, capacity
+               FROM node_controls
+               ORDER BY node_id, start_minute""") as cur:
+        return [{"node_id": nid, "start_minute": a, "end_minute": b,
+                 "capacity": cap}
+                for nid, a, b, cap in await cur.fetchall()]
 
 
 async def load_fixed_routes(db: aiosqlite.Connection):

@@ -6,7 +6,8 @@ import pytest
 from app.planner import Edge, World, plan_group
 
 
-def build_world(edges, exits, closures=(), fixed_load=None, smoke=()):
+def build_world(edges, exits, closures=(), fixed_load=None, smoke=(),
+                node_controls=()):
     edge_map = {e.id: e for e in edges}
     adj: dict[int, list[int]] = {}
     for e in edges:
@@ -19,18 +20,24 @@ def build_world(edges, exits, closures=(), fixed_load=None, smoke=()):
     smk: dict[int, list[tuple[int, int, int]]] = {}
     for eid, a, b, value in smoke:
         smk.setdefault(eid, []).append((a, b, value))
+    nctrl: dict[int, list[tuple[int, int, int]]] = {}
+    for nid, a, b, cap in node_controls:
+        nctrl.setdefault(nid, []).append((a, b, cap))
     return World(edges=edge_map, adjacency=adj, exits=list(exits),
                  closures=clo, fixed_load=dict(fixed_load or {}),
-                 smoke_windows=smk)
+                 smoke_windows=smk, node_controls=nctrl)
 
 
 def plan(world, gid=1, size=10, origin=1, earliest=0, deadline=100, now=0,
-         smoke_limit=None, exposure_used=0):
+         smoke_limit=None, exposure_used=0, start_is_intermediate=False,
+         fixed_node_wait=None):
     return plan_group(
         group_id=gid, size=size, origin=origin,
         earliest_departure=earliest, deadline=deadline,
         current_minute=now, world=world, smoke_limit=smoke_limit,
-        exposure_used=exposure_used)
+        exposure_used=exposure_used,
+        start_is_intermediate=start_is_intermediate,
+        fixed_node_wait=fixed_node_wait)
 
 
 def test_simple_earliest_route():
@@ -395,3 +402,126 @@ def test_smoke_relaxed_search_ignores_limit_for_attribution():
     r = plan(world, smoke_limit=0, deadline=10)
     assert r["status"] == "failed"
     assert r["reason"] == "EXPOSURE_LIMIT_EXCEEDED"
+
+
+# --------------------------------------------------------------------------
+# 中途节点计划滞留限流（只计前一通道离开到进入下一通道之间的等待）
+# --------------------------------------------------------------------------
+
+def test_node_control_does_not_touch_back_to_back_steps():
+    # 到达节点2立即进入下一通道：等待区间为空，不占名额
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100), Edge(2, 2, 3, 3, 100)], exits=[3],
+        node_controls=[(2, 0, 20, 1)])
+    r = plan(world)
+    assert r["status"] == "scheduled"
+    assert r["arrival_minute"] == 5
+    assert r["node_wait_delta"] == {}
+
+
+def test_node_control_origin_wait_is_free():
+    # 起点即节点2：出发前等待不占节点名额，限流再紧也不影响起点等待
+    world = build_world([Edge(2, 2, 3, 2, 100)], exits=[3],
+                        node_controls=[(2, 0, 20, 1)])
+    r = plan(world, origin=2, earliest=5)
+    assert r["status"] == "scheduled"
+    assert r["departure_minute"] == 5
+    assert r["node_wait_delta"] == {}
+
+
+def test_node_control_forces_detour_when_waiting_overquota():
+    # 1->2(4)；2->6(1) 封闭[4,8)（等待到8到达9）；2->3(4)->5(4) 绕行
+    # 到达12。节点2限流[4,8) 5人：等待10人全程超额。上游通道1又封闭
+    # [4,8)，无法把通行推迟到第4分钟进入以在第8分钟恰好到节点2（最早只
+    # 能第8分钟进入、第13分钟到达），故最优改为第4分钟到节点2后立即绕行
+    # [2,3]，第12分钟到达。
+    world = build_world(
+        [Edge(1, 1, 2, 4, 100), Edge(2, 2, 3, 4, 100),
+         Edge(3, 3, 5, 4, 100), Edge(5, 2, 6, 1, 100)],
+        exits=[5, 6], closures=[(5, 4, 8), (1, 4, 8)],
+        node_controls=[(2, 4, 8, 5)])
+    r = plan(world)
+    assert r["status"] == "scheduled"
+    assert [s["edge_id"] for s in r["steps"]] == [1, 2, 3]
+    assert r["arrival_minute"] == 12
+    assert r["node_wait_delta"] == {}
+
+
+def test_node_control_can_shift_wait_upstream_to_origin():
+    # 1->2(2)；2->6(1) 封闭[2,8)（等到8到达9）；绕行 2->3(4)->5(4) 到14。
+    # 节点2限流[2,8) 5人：等待超额，但可在起点把通道1推迟到第6分钟进入、
+    # 第8分钟到节点2立即进入通道5，仍第9分钟到达（优于绕行）。
+    # 起点等待不占名额。
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100), Edge(2, 2, 3, 4, 100),
+         Edge(3, 3, 5, 4, 100), Edge(5, 2, 6, 1, 100)],
+        exits=[5, 6], closures=[(5, 2, 8)],
+        node_controls=[(2, 2, 8, 5)])
+    r = plan(world)
+    assert r["status"] == "scheduled"
+    assert [s["edge_id"] for s in r["steps"]] == [1, 5]
+    assert r["steps"][0]["enter_minute"] == 6
+    assert r["steps"][1]["enter_minute"] == 8
+    assert r["arrival_minute"] == 9
+    # 到达节点2后零等待：无中途节点名额占用
+    assert r["node_wait_delta"] == {}
+
+
+def test_node_control_waiting_at_or_under_capacity_allowed():
+    # 等待10人，限流名额10恰好：等待方案保留
+    world = build_world(
+        [Edge(1, 1, 2, 4, 100), Edge(2, 2, 3, 4, 100),
+         Edge(3, 3, 5, 4, 100), Edge(5, 2, 6, 1, 100)],
+        exits=[5, 6], closures=[(5, 4, 8)],
+        node_controls=[(2, 4, 8, 10)])
+    r = plan(world)
+    assert [s["edge_id"] for s in r["steps"]] == [1, 5]
+    assert r["arrival_minute"] == 9
+    # 等待 [4,8) 逐分钟占 10
+    assert r["node_wait_delta"] == {(2, m): 10 for m in range(4, 8)}
+
+
+def test_node_control_contention_between_groups_staggers():
+    # A、B 都 1->2(4)->6(1)，通道5封闭[4,6)；节点2第4、5分钟名额15。
+    # A 10人高优先级等待[4,6)；B 10人不能在第4分钟等（20>15），
+    # 推迟上游通道1到第2分钟进入 -> 第6分到节点2立即进通道5，两组都到达7
+    world = build_world(
+        [Edge(1, 1, 2, 4, 100), Edge(2, 2, 3, 9, 100),
+         Edge(3, 3, 5, 9, 100), Edge(5, 2, 6, 1, 100)],
+        exits=[5, 6], closures=[(5, 4, 6)],
+        node_controls=[(2, 4, 6, 15)])
+    a = plan(world, gid=1, size=10, deadline=40)
+    for k, v in a["load_delta"].items():
+        world.fixed_load[k] = world.fixed_load.get(k, 0) + v
+    for k, v in a["node_wait_delta"].items():
+        world.fixed_node_load[k] = world.fixed_node_load.get(k, 0) + v
+    b = plan(world, gid=2, size=10, deadline=40)
+    assert b["status"] == "scheduled"
+    assert b["steps"][0]["enter_minute"] == 2
+    assert b["steps"][1]["enter_minute"] == 6
+    assert b["arrival_minute"] == 7
+
+
+def test_delay_replan_reserved_pre_recovery_wait_overquota_fails():
+    # 节点滞留改编：current=2、恢复分钟8，滞留节点2限流[2,8) 9人，组10人。
+    # 恢复前固定等待[2,8)本身每分钟10>9，余程无解
+    world = build_world(
+        [Edge(5, 2, 6, 1, 100)], exits=[6],
+        node_controls=[(2, 2, 8, 9)])
+    reserved = {(2, m): 10 for m in range(2, 8)}
+    r = plan(world, origin=2, earliest=8, now=2, deadline=40,
+             start_is_intermediate=True, fixed_node_wait=reserved)
+    assert r["status"] == "failed"
+    assert r["reason"] == "INSUFFICIENT_NODE_CAPACITY"
+
+
+def test_delay_replan_reserved_wait_within_capacity_succeeds():
+    world = build_world(
+        [Edge(5, 2, 6, 1, 100)], exits=[6],
+        node_controls=[(2, 2, 8, 10)])
+    reserved = {(2, m): 10 for m in range(2, 8)}
+    r = plan(world, origin=2, earliest=8, now=2, deadline=40,
+             start_is_intermediate=True, fixed_node_wait=reserved)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 8
+    assert r["arrival_minute"] == 9

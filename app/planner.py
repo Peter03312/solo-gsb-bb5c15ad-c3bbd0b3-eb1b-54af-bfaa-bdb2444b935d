@@ -18,16 +18,24 @@
   为零，在节点等待不计暴露。可登记非负累计暴露上限的组，其沿路线每
   分钟占用通道的暴露值之和不得超过上限（节点等待可让烟雾消散后通行）；
   未设上限的组不受此约束。
+* 节点滞留限流：可为**非出口节点**登记左闭右开的限流时段 ``[a, b)`` 及
+  时段内每分钟最多停留人数，同一节点的限流时段互不重叠；未登记的分钟
+  不限额。一组从前一通道离开到进入下一通道之间按人数占用该节点每分钟
+  名额；**出发前在起点等待不占名额，通道在途与抵达出口后也不计**。
+  ``fixed_node_load`` 存放 (节点, 分钟) -> 已固定（已出发）组在该节点
+  的滞留人数，搜索中的组逐组累加到同一份字典（与通道容量的处理方式一
+  致）。限流只覆盖中途等待，故从起点出发的第一段不做节点名额检查。
 
 择优规则
 --------
 每组在各自允许出发的时间范围内寻找：到达分钟最早；同到达时出口编号最小；
 同出口同到达时通道编号序列字典序最小。由于通道在节点处允许等待（等待由
-封闭/容量/烟雾迫使），边到达时间关于进入时间满足 FIFO，因此用时变最短路
-求解。为正确处理"到达相同、通道序列字典序更小"以及"晚出发但累计暴露更
-低"的并列情形，每个节点保留 (到达分钟, 通道序列, 累计暴露) 的 Pareto
-标签集；对同一条边，除最早可进入分钟外，还在暴露取值发生变化的每个区间
-尝试延后进入（等待烟雾消散）。
+封闭/容量/烟雾/节点滞留限流迫使），边到达时间关于进入时间满足 FIFO，因此
+用时变最短路求解。为正确处理"到达相同、通道序列字典序更小"、"晚出发但
+累计暴露更低"以及"早到但需占用拥挤节点等待、晚到反而可立即通行"的并列
+情形，每个节点保留 (到达分钟, 通道序列, 累计暴露) 的 Pareto 标签集；对
+同一条边，除最早可进入分钟外，还在暴露取值发生变化或节点等待名额可行性
+发生变化的每个区间尝试延后进入（等待烟雾消散 / 避开限流分钟）。
 """
 from __future__ import annotations
 
@@ -64,6 +72,20 @@ class World:
     # [(a, b, 时段内每分钟暴露值), ...]；未列入的分钟暴露值为 0
     smoke_windows: dict[int, list[tuple[int, int, int]]] = \
         field(default_factory=dict)
+    # node_id -> 已按开始分钟升序排列、互不重叠的
+    # [(a, b, 时段内每分钟最多停留人数), ...]；仅非出口节点可登记
+    node_controls: dict[int, list[tuple[int, int, int]]] = \
+        field(default_factory=dict)
+    # (node_id, minute) -> 已固定（已出发）组在该节点计划滞留的总人数。
+    # 同一轮重排中，已排入组的中途等待也逐组累加进来（贪婪口径，与
+    # fixed_load 相同）；出发前起点等待不计入。
+    fixed_node_load: dict[tuple[int, int], int] = field(default_factory=dict)
+    # 本次搜索的起点（origin）：起点等待不占节点名额，需要等待名额的
+    # 只是从前一通道到达后、进入下一通道前的中途节点。节点滞留改编以
+    # 滞留节点为起点重找余程，该节点的等待此时属于中途等待，调用方会
+    # 通过 start_is_intermediate=True 告知搜索。
+    start_node: Optional[int] = None
+    start_is_intermediate: bool = False
 
 
 class PlanningError(Exception):
@@ -106,11 +128,140 @@ def edge_traversal_exposure(world: World, edge_id: int, entry: int,
                for minute in range(entry, leave))
 
 
+def node_limit(world: World, node_id: int, minute: int) -> Optional[int]:
+    """节点某分钟的计划滞留上限；该分钟未登记限流时段时返回 None（不限额）。"""
+    for a, b, cap in world.node_controls.get(node_id, ()):
+        if a > minute:
+            break
+        if minute < b:
+            return cap
+    return None
+
+
+def node_wait_ok(world: World, node_id: int, arrival: int, entry: int,
+                 size: int,
+                 extra_load: Optional[dict[tuple[int, int], int]] = None
+                 ) -> bool:
+    """一组在节点上的等待区间 [arrival, entry) 是否逐分钟满足滞留名额。
+
+    名额按"已固定占用 + 本轮已排入组占用 + 本组人数"逐分钟核算；未登记
+    限流的分钟不限额（天然通过）。区间为空（到达即可进入）时也通过。
+    ``extra_load`` 为额外计入的占用（节点滞留改编时，本组在滞留节点上
+    恢复前必须占用的等待名额——该槽位不能再被本组余程等待复用）。
+    """
+    if entry <= arrival:
+        return True
+    for minute in range(arrival, entry):
+        cap = node_limit(world, node_id, minute)
+        if cap is None:
+            continue
+        used = world.fixed_node_load.get((node_id, minute), 0)
+        if extra_load:
+            used += extra_load.get((node_id, minute), 0)
+        if used + size > cap:
+            return False
+    return True
+
+
+def _node_wait_breakpoints(world: World, node_id: int,
+                           arrival: int) -> list[int]:
+    """节点等待名额可行性随"进入分钟"发生变化的候选分界点。
+
+    等待区间为 [arrival, entry)：进入分钟从 t 变为 t+1 时，等待区间失去
+    分钟 t。限流时段 [a,b) 两侧的阶跃产生候选：a（自 a 起等待不再包含
+    a）与 b（等待延伸到 b 才开始再次占用 b）；早于到达分钟的候选无意义。
+    """
+    points: list[int] = []
+    for a, b, _cap in world.node_controls.get(node_id, ()):
+        if b > arrival:
+            points.append(max(a, arrival))
+            points.append(b)
+    return sorted(p for p in set(points) if p >= arrival)
+
+
+def _node_arrival_entry_breakpoints(world: World, node_id: int,
+                                    edge_minutes: int, lo: int,
+                                    horizon: int) -> list[int]:
+    """进入"终点为 node_id 的入边"的候选进入分钟（用于把等待前移到上游）。
+
+    节点限流使得"晚到该节点、到了立即走下一条边"可能优于"早到后在拥挤
+    节点上等待"，因此入边除最早可进入分钟外，还需提供使**到达分钟**
+    （= 进入分钟 + 通行分钟）落在该节点关键时刻的候选：
+
+    * 本节点各限流时段 [a,b) 的两端 a、b；
+    * 各出边封闭结束分钟（封闭结束当分钟即可进入）；
+    * 各出边容量管制时段两端 a、b（有效上限阶跃）；
+    * 各出边烟雾断点（与零等待结合仍可得到烟雾最优标签）。
+
+    只在该节点登记了限流时段时有意义；调用方负责门控。返回的是入边的
+    **进入分钟**（已裁剪到 [lo, horizon - edge_minutes]），可行性（入边
+    自身封闭/容量与上游节点等待名额）仍由 :func:`earliest_entry` 复核。
+    """
+    arrivals: set[int] = set()
+    for a, b, _cap in world.node_controls.get(node_id, ()):
+        arrivals.update((a, b))
+    for eid in world.adjacency.get(node_id, ()):
+        for a, b in world.closures.get(eid, ()):
+            arrivals.update((a, b))
+        for a, b, _cap in world.capacity_controls.get(eid, ()):
+            arrivals.update((a, b))
+        for p in _entry_breakpoints(world.edges[eid], world):
+            arrivals.add(p)
+    entries = set()
+    for s in arrivals:
+        t = s - edge_minutes
+        if lo <= t and s <= horizon:
+            entries.add(t)
+    return sorted(entries)
+
+
 def _dominates(a_time: int, a_seq: tuple[int, ...], a_exposure: int,
-               b_time: int, b_seq: tuple[int, ...], b_exposure: int) -> bool:
-    """标签 a 是否支配标签 b：到达不晚、通道序列字典序不更大、暴露不更高。"""
-    return (a_time <= b_time and a_seq <= b_seq
-            and a_exposure <= b_exposure)
+               b_time: int, b_seq: tuple[int, ...], b_exposure: int,
+               *, world: "World | None" = None, node: Optional[int] = None,
+               size: int = 0, check_node_wait: bool = False,
+               extra_load: Optional[dict[tuple[int, int], int]] = None
+               ) -> bool:
+    """标签 a 是否支配标签 b：到达不晚、通道序列字典序不更大、暴露不更高。
+
+    早到标签要复现晚到标签的未来，必须在该节点上等待 ``[a_time, b_time)``。
+    存在节点滞留限流时，这段等待未必逐分钟有名额：若等待区间任一分钟
+    已固定/已排入占用加本组人数超过该分钟名额，则 a 不能支配 b
+    （``check_node_wait=True`` 且区间非空时额外校验；起点出发前的等待不
+    占名额，调用方对根标签传 False）。``a_time == b_time`` 时区间为空，
+    退化为原口径。``extra_load`` 为本组恢复前已必须占用的滞留名额。
+    """
+    if not (a_time <= b_time and a_seq <= b_seq
+            and a_exposure <= b_exposure):
+        return False
+    if check_node_wait and world is not None and a_time < b_time:
+        if not node_wait_ok(world, node, a_time, b_time, size, extra_load):
+            return False
+    return True
+
+
+def _node_wait_bound(world: World, node_id: int, arrival: int,
+                     size: int, horizon: int,
+                     extra_load: Optional[dict[tuple[int, int], int]] = None
+                     ) -> Optional[int]:
+    """返回该标签在该节点上的最晚可进入分钟。
+
+    从 ``arrival`` 起逐分钟考察等待名额：设 m 为第一个"已登记限流且
+    已占用 + 本组人数超过名额"的分钟，则等待区间包含 m 即不可行，故可进
+    入分钟 t 必须满足 ``t <= m``（区间 [arrival, t) 不含 m）。可行性随
+    t 单调：一旦越过 m，更晚进入只会继续包含 m，不可能恢复。不存在这样
+    的分钟时返回 None（节点等待不受限）。``extra_load`` 含义同
+    :func:`node_wait_ok`（本组恢复前已必须占用的滞留名额）。
+    """
+    for minute in range(arrival, horizon + 1):
+        cap = node_limit(world, node_id, minute)
+        if cap is None:
+            continue
+        used = world.fixed_node_load.get((node_id, minute), 0)
+        if extra_load:
+            used += extra_load.get((node_id, minute), 0)
+        if used + size > cap:
+            return minute
+    return None
 
 
 def earliest_entry(edge: Edge, start: int, size: int, world: World,
@@ -192,7 +343,9 @@ def _entry_breakpoints(edge: Edge, world: World) -> list[int]:
 
 def entry_options(edge: Edge, start: int, size: int, world: World,
                   horizon: int, *, use_closures: bool, use_loads: bool,
-                  use_smoke: bool) -> list[tuple[int, int]]:
+                  use_smoke: bool,
+                  wait_bound: Optional[int] = None
+                  ) -> list[tuple[int, int]]:
     """枚举该边 Pareto 最优的 (进入分钟, 本次通行累计暴露) 候选。
 
     封闭/容量只允许"跳到下一个可进入分钟"；烟雾不禁止进入，但等待烟雾
@@ -200,39 +353,61 @@ def entry_options(edge: Edge, start: int, size: int, world: World,
     区间内取最早的可行进入分钟，再按 (进入更早且暴露不更高) 做 Pareto
     过滤。``use_smoke=False``（归因用的放松搜索）或该边没有烟雾时段时，
     只需最早可进入分钟这一个候选。
+
+    ``wait_bound`` 给出在边起点节点等待的最晚可进入分钟（节点滞留限流
+    所致；起点出发前等待不占名额，此时为 None）：可进入分钟晚于该界的
+    候选一律丢弃（等待区间包含超额分钟，更晚进入不可能恢复）。
     """
-    earliest = earliest_entry(edge, start, size, world, horizon,
-                              use_closures=use_closures,
-                              use_loads=use_loads)
+    def bounded(t0: int) -> Optional[int]:
+        t = earliest_entry(edge, t0, size, world, horizon,
+                           use_closures=use_closures,
+                           use_loads=use_loads)
+        if t is not None and wait_bound is not None and t > wait_bound:
+            return None
+        return t
+
+    earliest = bounded(start)
     if earliest is None:
         return []
-    if not use_smoke or not world.smoke_windows.get(edge.id):
+    # 边的终点登记了节点滞留限流时："晚到立即走"可能优于"早到后在拥挤
+    # 节点等待"，需额外枚举使到达分钟落在终点关键时刻的入边进入候选，并
+    # 保留全部（不再用"越晚暴露越低"过滤，否则会误删为节点名额而推迟的
+    # 候选）；终点无限流时节点等待名额不改变可行性，沿用原口径即可。
+    dst_controlled = bool(world.node_controls.get(edge.dst))
+    if (not dst_controlled
+            and (not use_smoke or not world.smoke_windows.get(edge.id))):
         return [(earliest, edge_traversal_exposure(
             world, edge.id, earliest, earliest + edge.minutes))]
 
     candidates: dict[int, int] = {}
     wanted = [earliest]
     for p in _entry_breakpoints(edge, world):
-        if p >= start:
+        if p >= start and (wait_bound is None or p <= wait_bound):
             wanted.append(p)
+    if dst_controlled:
+        for p in _node_arrival_entry_breakpoints(
+                world, edge.dst, edge.minutes, start, horizon):
+            if wait_bound is None or p <= wait_bound:
+                wanted.append(p)
     for t0 in sorted(set(wanted)):
-        t = earliest_entry(edge, t0, size, world, horizon,
-                           use_closures=use_closures,
-                           use_loads=use_loads)
+        t = bounded(t0)
         if t is None:
             continue
         candidates.setdefault(
             t, edge_traversal_exposure(world, edge.id, t, t + edge.minutes))
 
-    # 按进入分钟升序保留暴露严格下降的候选：更晚但暴露不更低的进入被
-    # （更早或等暴露的）候选支配
-    options: list[tuple[int, int]] = []
-    best_exposure: Optional[int] = None
-    for t, exposure in sorted(candidates.items()):
-        if best_exposure is None or exposure < best_exposure:
-            options.append((t, exposure))
-            best_exposure = exposure
-    return options
+    # 终点无限流时：按进入分钟升序保留暴露严格下降的候选（更晚但暴露不
+    # 更低的进入被更早或等暴露的候选支配）。终点限流时不过滤——推迟进入
+    # 可能以更高暴露换取终点节点等待名额，交由标签层支配判定。
+    if not dst_controlled:
+        options: list[tuple[int, int]] = []
+        best_exposure: Optional[int] = None
+        for t, exposure in sorted(candidates.items()):
+            if best_exposure is None or exposure < best_exposure:
+                options.append((t, exposure))
+                best_exposure = exposure
+        return options
+    return [(t, candidates[t]) for t in sorted(candidates)]
 
 
 @dataclass
@@ -241,8 +416,9 @@ class _Label:
 
     arrival 为到达该节点的分钟；seq 为通道编号序列；exposure 为从起点沿
     该标签累计的烟雾暴露；parent/entry/edge_id 记录上一跳，用于选定路线
-    后重放逐段时刻。标签对象身份参与堆项去重，被支配移除的旧标签其堆项
-    自动过期。
+    后重放逐段时刻。``at_origin`` 标记该标签是否位于本次搜索起点：从起点
+    出发前的等待不占节点名额，其余（中途节点）等待均受节点滞留限流约束。
+    标签对象身份参与堆项去重，被支配移除的旧标签其堆项自动过期。
     """
     arrival: int
     seq: tuple[int, ...]
@@ -252,18 +428,28 @@ class _Label:
     parent: Optional["_Label"] = None
     entry: Optional[int] = None
     edge_id: Optional[int] = None
+    at_origin: bool = False
 
 
 def _search(world: World, *, origin: int, size: int, start: int,
             horizon: int, use_closures: bool, use_loads: bool,
-            use_smoke: bool, smoke_limit: Optional[int] = None,
-            exposure_used: int = 0
+            use_smoke: bool, use_node_loads: bool = True,
+            smoke_limit: Optional[int] = None,
+            exposure_used: int = 0,
+            start_is_intermediate: bool = False,
+            reserved_node_load:
+            Optional[dict[tuple[int, int], int]] = None
             ) -> dict[int, "_Label"]:
     """多标签时变 Dijkstra。
 
     返回每个可达出口的最优标签（累计暴露不超上限的前提下，到达最早、
     通道序列字典序最小）。路径不允许重复经过节点（疏散路径无需绕环，
     同时保证标签集有限）。
+
+    ``use_node_loads=False`` 为归因用的放松搜索：忽略节点滞留名额
+    （起点等待本就不占名额）。``start_is_intermediate`` 用于节点滞留改编：
+    以滞留节点为起点重找余程时，该节点恢复前的等待属于"前一通道离开后、
+    下一通道进入前"的中途等待，仍须受名额约束。
     """
     # node -> Pareto 标签集
     labels: dict[int, list[_Label]] = {}
@@ -271,15 +457,32 @@ def _search(world: World, *, origin: int, size: int, start: int,
     counter = 0
 
     root = _Label(arrival=start, seq=(), exposure=0, node=origin,
-                  visited=frozenset({origin}))
+                  visited=frozenset({origin}), at_origin=True)
     labels[origin] = [root]
     heapq.heappush(heap, (start, (), 0, counter, root))
+
+    def dominates(a: "_Label", b: "_Label") -> bool:
+        return _dominates(
+            a.arrival, a.seq, a.exposure, b.arrival, b.seq, b.exposure,
+            world=world, node=a.node, size=size,
+            check_node_wait=(use_node_loads and not a.at_origin),
+            extra_load=reserved_node_load)
 
     while heap:
         arrive, _sq, _exp, _idx, label = heapq.heappop(heap)
         current = labels.get(label.node, [])
         if label not in current:
             continue  # 已被更优标签支配的过期堆项
+        # 起点出发前等待：普通规划不占名额；节点滞留改编（start_is_
+        # intermediate）时该节点等待属中途等待，且恢复前 [当前分钟, 恢复
+        # 分钟) 的滞留已作为本组预占（reserved_node_load），故仍需按名额
+        # 设界。其余中途节点的等待一律受节点滞留限流约束。
+        if use_node_loads and (
+                not label.at_origin or start_is_intermediate):
+            wait_bound = _node_wait_bound(
+                world, label.node, arrive, size, horizon, reserved_node_load)
+        else:
+            wait_bound = None
         for eid in world.adjacency.get(label.node, ()):
             edge = world.edges[eid]
             if edge.dst in label.visited:
@@ -287,7 +490,7 @@ def _search(world: World, *, origin: int, size: int, start: int,
             for entry, added in entry_options(
                     edge, arrive, size, world, horizon,
                     use_closures=use_closures, use_loads=use_loads,
-                    use_smoke=use_smoke):
+                    use_smoke=use_smoke, wait_bound=wait_bound):
                 total_exposure = label.exposure + added
                 # 累计暴露上限：已走前缀额度 + 余程暴露不得超过组上限。
                 # use_smoke=False 为归因用的放松搜索，此时不施加上限过滤。
@@ -300,18 +503,14 @@ def _search(world: World, *, origin: int, size: int, start: int,
                 nxt = _Label(arrival=nxt_time, seq=nxt_seq,
                              exposure=total_exposure, node=nxt_node,
                              visited=label.visited | {nxt_node},
-                             parent=label, entry=entry, edge_id=eid)
+                             parent=label, entry=entry, edge_id=eid,
+                             at_origin=False)
 
                 bucket = labels.setdefault(nxt_node, [])
-                if any(_dominates(lb.arrival, lb.seq, lb.exposure,
-                                  nxt_time, nxt_seq, total_exposure)
-                       for lb in bucket):
+                if any(dominates(lb, nxt) for lb in bucket):
                     continue
                 # 移除被新标签支配的旧标签
-                bucket[:] = [
-                    lb for lb in bucket
-                    if not _dominates(nxt_time, nxt_seq, total_exposure,
-                                      lb.arrival, lb.seq, lb.exposure)]
+                bucket[:] = [lb for lb in bucket if not dominates(nxt, lb)]
                 bucket.append(nxt)
                 if len(bucket) > MAX_LABELS_PER_NODE:
                     raise PlanningError(
@@ -343,8 +542,15 @@ def _pick(best_by_exit: dict[int, "_Label"]
 
 
 def _reconstruct(world: World, size: int, label: "_Label"
-                 ) -> tuple[list[dict], int, dict[tuple[int, int], int]]:
-    """沿标签的父指针重放，得到每段进入/离开分钟与总负载增量。"""
+                 ) -> tuple[list[dict], int, dict[tuple[int, int], int],
+                            dict[tuple[int, int], int]]:
+    """沿标签的父指针重放，得到每段进入/离开分钟、通道负载与节点等待增量。
+
+    返回 (steps, 到达分钟, load_delta, node_wait_delta)。node_wait_delta
+    的键为 (节点, 分钟)，只计入"前一通道离开到进入下一通道之间"的中途
+    等待（含节点滞留改编时以滞留节点为起点的等待）；出发前起点等待、
+    通道在途与抵达出口后的时间均不计入。
+    """
     chain: list[_Label] = []
     node_label = label
     while node_label.parent is not None:
@@ -354,7 +560,9 @@ def _reconstruct(world: World, size: int, label: "_Label"
 
     steps: list[dict] = []
     load_delta: dict[tuple[int, int], int] = {}
+    node_wait_delta: dict[tuple[int, int], int] = {}
     for lb in chain:
+        parent = lb.parent
         edge = world.edges[lb.edge_id]
         entry = lb.entry
         leave = entry + edge.minutes
@@ -370,21 +578,35 @@ def _reconstruct(world: World, size: int, label: "_Label"
         for minute in range(entry, leave):
             load_delta[(lb.edge_id, minute)] = (
                 load_delta.get((lb.edge_id, minute), 0) + size)
-    return steps, label.arrival, load_delta
+        # 进入该段前在其起点节点上的等待；根标签在起点（普通规划）的等待
+        # 属于"出发前起点等待"，不计；节点滞留改编的根标签 at_origin=False
+        if not parent.at_origin:
+            for minute in range(parent.arrival, entry):
+                node_wait_delta[(edge.src, minute)] = (
+                    node_wait_delta.get((edge.src, minute), 0) + size)
+    return steps, label.arrival, load_delta, node_wait_delta
 
 
 def plan_group(*, group_id: int, size: int, origin: int,
                earliest_departure: int, deadline: int, current_minute: int,
                world: World, smoke_limit: Optional[int] = None,
-               exposure_used: int = 0) -> dict:
+               exposure_used: int = 0,
+               start_is_intermediate: bool = False,
+               fixed_node_wait:
+               Optional[dict[tuple[int, int], int]] = None) -> dict:
     """为单个组规划，返回 scheduled / failed 结果。
 
-    world.fixed_load 中应已包含此前已规划（同批高优先级）组的占用；
-    调用方在拿到 scheduled 结果后须把 load_delta 累加进 fixed_load。
+    world.fixed_load / world.fixed_node_load 中应已包含此前已规划（同批
+    高优先级）组的通道占用与中途节点等待；调用方在拿到 scheduled 结果后
+    须把 load_delta / node_wait_delta 分别累加进对应字典。
 
     smoke_limit 为该组非负累计暴露上限（未设上限传 None）；
     exposure_used 为已走前缀按原计划时刻累计的暴露（节点滞留改编寻找
-    余程时使用，普通未出发组规划传 0）。
+    余程时使用，普通未出发组规划传 0）；start_is_intermediate 用于节点
+    滞留改编（以滞留节点为起点的等待仍属中途等待、占节点名额）；
+    fixed_node_wait 给出本组在余程起点节点上**恢复前已必须占用**的等待
+    名额（节点滞留报告后 [当前分钟, 恢复分钟) 的滞留），该槽位不能再被
+    本组余程等待复用。
     """
     start = max(current_minute, earliest_departure)
     if start > deadline:
@@ -395,17 +617,43 @@ def plan_group(*, group_id: int, size: int, origin: int,
             "detail": f"当前分钟 {current_minute} 已超过规划截止分钟 {deadline}",
         }
 
-    def search(*, closures: bool, loads: bool, smoke: bool):
+    # 节点滞留改编：本组在滞留节点上"自当前分钟到恢复分钟"的等待是已固定
+    # 的事实（在根标签到达时刻 start 之前），若其中任一分钟的名额已无法
+    # 容纳本组，则恢复前滞留本身超额——再找余程也无法消除，直接判无解。
+    if start_is_intermediate and fixed_node_wait:
+        for (nid, minute), add in fixed_node_wait.items():
+            if minute < current_minute or minute >= start:
+                continue
+            cap = node_limit(world, nid, minute)
+            if cap is None:
+                continue
+            used = world.fixed_node_load.get((nid, minute), 0)
+            if used + add > cap:
+                return {
+                    "group_id": group_id,
+                    "status": "failed",
+                    "reason": "INSUFFICIENT_NODE_CAPACITY",
+                    "detail": (
+                        f"组在滞留节点 {nid} 恢复前的固定等待在第 {minute} "
+                        f"分钟超过该节点限流名额（{used + add} > {cap}），"
+                        "无法通过余程安排消除")}
+
+    def search(*, closures: bool, loads: bool, smoke: bool,
+               node_loads: bool = True):
         return _search(world, origin=origin, size=size, start=start,
                        horizon=deadline, use_closures=closures,
                        use_loads=loads, use_smoke=smoke,
-                       smoke_limit=smoke_limit, exposure_used=exposure_used)
+                       use_node_loads=node_loads,
+                       smoke_limit=smoke_limit, exposure_used=exposure_used,
+                       start_is_intermediate=start_is_intermediate,
+                       reserved_node_load=fixed_node_wait)
 
     # 1) 完整约束下寻路
     picked = _pick(search(closures=True, loads=True, smoke=True))
     if picked is not None:
         arrive, exit_id, seq, label = picked
-        steps, _, load_delta = _reconstruct(world, size, label)
+        steps, _, load_delta, node_wait_delta = _reconstruct(
+            world, size, label)
         departure = steps[0]["enter_minute"] if steps else start
         return {
             "group_id": group_id,
@@ -415,11 +663,14 @@ def plan_group(*, group_id: int, size: int, origin: int,
             "arrival_minute": arrive,
             "steps": steps,
             "load_delta": load_delta,
+            "node_wait_delta": node_wait_delta,
         }
 
     # 2) 归因：分别放松单一约束
     relaxed_closure = search(closures=False, loads=True, smoke=True)
     relaxed_capacity = search(closures=True, loads=False, smoke=True)
+    relaxed_nodes = search(closures=True, loads=True, smoke=True,
+                           node_loads=False)
     relaxed_smoke = search(closures=True, loads=True, smoke=False)
 
     if _pick(relaxed_closure) is not None:
@@ -430,6 +681,12 @@ def plan_group(*, group_id: int, size: int, origin: int,
         reason, detail = (
             "INSUFFICIENT_CAPACITY",
             "忽略通道容量限制后可在截止前到达，容量竞争阻断了所有可行路线")
+    elif _pick(relaxed_nodes) is not None:
+        reason, detail = (
+            "INSUFFICIENT_NODE_CAPACITY",
+            "忽略中途节点计划滞留名额后可在截止前到达，节点限流（可推迟"
+            "上游通行或改走路线）与既有封闭、通道容量共同阻断了截止前的"
+            "所有可行路线")
     elif smoke_limit is not None and _pick(relaxed_smoke) is not None:
         reason, detail = (
             "EXPOSURE_LIMIT_EXCEEDED",
@@ -442,7 +699,10 @@ def plan_group(*, group_id: int, size: int, origin: int,
         far_horizon = deadline + total_w + 1
         plain = _search(world, origin=origin, size=size, start=start,
                         horizon=far_horizon, use_closures=False,
-                        use_loads=False, use_smoke=False)
+                        use_loads=False, use_smoke=False,
+                        use_node_loads=False,
+                        start_is_intermediate=start_is_intermediate,
+                        reserved_node_load=fixed_node_wait)
         if _pick(plain) is None:
             reason, detail = (
                 "UNREACHABLE_EXIT",
@@ -450,8 +710,8 @@ def plan_group(*, group_id: int, size: int, origin: int,
         else:
             reason, detail = (
                 "INSUFFICIENT_CAPACITY",
-                "封闭时段、通道容量与烟雾暴露上限共同阻断了截止前的"
-                "所有可行路线")
+                "封闭时段、通道容量、中途节点滞留名额与烟雾暴露上限共同"
+                "阻断了截止前的所有可行路线")
 
     return {
         "group_id": group_id,

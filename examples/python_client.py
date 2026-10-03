@@ -576,6 +576,72 @@ if __name__ == "__main__":
     show("已出发组再登记上限（预期 409 SMOKE_LIMIT_TARGET_DEPARTED）",
          status, plan)
 
+    # ---- 中途节点计划滞留限流 ----
+    node_scenario = {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 100},
+            {"id": 2, "src": 2, "dst": 3, "minutes": 9, "capacity": 100},
+            {"id": 3, "src": 3, "dst": 5, "minutes": 9, "capacity": 100},
+            {"id": 5, "src": 2, "dst": 6, "minutes": 1, "capacity": 100},
+        ],
+        "exits": [5, 6],
+        "closures": [{"edge_id": 5, "start_minute": 4, "end_minute": 6}],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 40},
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 40},
+        ],
+    }
+    status, plan = call("POST", "/scenario", node_scenario)
+    show("重置节点限流演示场景", status, plan)
+
+    status, plan = call("POST", "/node-controls",
+                        {"node_id": 2, "start_minute": 4,
+                         "end_minute": 6, "capacity": 15})
+    show("节点2第4..6分钟每分钟最多15人（两组错峰，组2推迟上游）",
+         status, plan)
+    summarize(plan)
+
+    show("节点2逐分钟计划停留人数", *call("GET", "/nodes/2/stays"))
+    show("节点限流时段列表", *call("GET", "/node-controls"))
+
+    for title, body in (
+        ("节点不存在（预期 422）",
+         {"node_id": 99, "start_minute": 0, "end_minute": 5, "capacity": 3}),
+        ("出口节点6（预期 422）",
+         {"node_id": 6, "start_minute": 0, "end_minute": 5, "capacity": 3}),
+        ("上限0（预期 422）",
+         {"node_id": 2, "start_minute": 0, "end_minute": 5, "capacity": 0}),
+        ("同节点时段重叠（预期 409 NODE_CONTROL_OVERLAP）",
+         {"node_id": 2, "start_minute": 5, "end_minute": 9, "capacity": 15}),
+    ):
+        show(title, *call("POST", "/node-controls", body))
+
+    call("POST", "/tick", {"minutes": 4})
+    status, payload = call("POST", "/node-controls",
+                           {"node_id": 2, "start_minute": 4,
+                            "end_minute": 6, "capacity": 5})
+    show("已出发组固定等待超额（预期 409 "
+         "NODE_CONTROL_OVERLOADS_DEPARTED_GROUP）", status, payload)
+
+    # 唯一路线 + 节点限流9人 + 滞留至第8分钟 -> 待救援
+    call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 2, "capacity": 30},
+            {"id": 5, "src": 2, "dst": 6, "minutes": 1, "capacity": 30}],
+        "exits": [6], "closures": [],
+        "groups": [{"id": 1, "size": 10, "origin": 1,
+                    "earliest_departure": 0, "priority": 10,
+                    "deadline": 40}]})
+    call("POST", "/tick", {"minutes": 2})
+    call("POST", "/node-controls",
+         {"node_id": 2, "start_minute": 2, "end_minute": 8, "capacity": 9})
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 8})
+    show("限流9人时报告滞留至第8分钟（预期 awaiting_rescue）", status, plan)
+    summarize(plan)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)
